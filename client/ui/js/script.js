@@ -97,6 +97,11 @@ let currentLng = null;
 
 let inhibited = false;
 
+let isPaging = false;
+let isAlertPlaying = false;
+let isTonePlaying = false;
+let tonesQueue = [];
+
 function socketOpen() {
     return socket && socket.readyState === WebSocket.OPEN;
 }
@@ -202,7 +207,7 @@ function isMobile() {
 }
 
 function isScannerModel() {
-    return radioModel === "UNIG5";
+    return radioModel === "UNIG5" || radioModel === "MIN6";
 }
 
 function setBatteryLevel() {
@@ -495,6 +500,16 @@ window.addEventListener('message', async function (event) {
                 SendGroupVoiceRequest();
                 isVoiceRequested = true;
                 isVoiceGranted = false;
+
+                // This should prevent the 'stuck' state you can get in when trying to transmit while someone else already is
+                setTimeout(() => {
+                    if (isVoiceRequested && !isVoiceGranted) {
+                        console.debug("did not get response from WLS within 5 seconds"); // Timing might need tweaking I think 5 seconds is a fair timeout for most cases
+                        bonk()
+                        isVoiceRequested = false;
+                        isVoiceGrantHandled = false;
+                    }
+                }, 5000);
             } /*else {
                 isTxing = false;
                 document.getElementById("rssi-icon").src = `models/${radioModel}/icons/rssi${currentRssiLevel}.png`;
@@ -618,6 +633,13 @@ window.addEventListener('message', async function (event) {
         currentRssiLevel = event.data.level;
         currentDbLevel = event.data.dbRssi;
         rssiIcon.src = `models/${radioModel}/icons/rssi${event.data.level}.png`;
+    } else if (event.data.type === "manDownState"){
+        if (event.data.active) {
+            StartEmergencyAlarm(); // TODO: Add pre-alarm like apx has etc
+            console.log("man down active");
+        }
+        else
+            console.log("reset man down"); // TODO: handle at some point
     }
 });
 
@@ -1537,9 +1559,18 @@ function detectTone(samples) {
     source.connect(analyser);
     analyser.connect(context.destination);
 
-    source.start();
+    if (isPaging) {
+        setTimeout(() => {
+            playTones(source, analyser, context, fftSize);
+        }, 3250);
+    } else {
+        playTones(source, analyser, context, fftSize);
+    }
+}
 
-    context.startRendering().then(() => {
+function playTones(source, analyser, ctx, fftSize) {
+    source.start();
+    ctx.startRendering().then(() => {
         const freqData = new Float32Array(analyser.frequencyBinCount);
         analyser.getFloatFrequencyData(freqData);
 
@@ -1558,16 +1589,13 @@ function detectTone(samples) {
     });
 }
 
+
 function processTone(frequency) {
     const now = Date.now();
 
-    //console.log(`detected frequency: ${frequency} Hz`);
-
     if (frequency < 300 || frequency > 3000) {
-        //console.log('frequency out of valid range');
         if (lastTone !== null) {
             const duration = now - toneStartTime;
-            //console.log(`ending tone ${lastTone} after ${duration} ms`);
             toneHistory.push({ freq: lastTone, duration });
             detectQC2Pair();
             lastTone = null;
@@ -1577,29 +1605,20 @@ function processTone(frequency) {
     }
 
     if (lastTone === null) {
-        //console.log(`starting new tone ${frequency}`);
         toneStartTime = now;
         lastTone = frequency;
-    } else if (Math.abs(frequency - lastTone) <= FREQUENCY_TOLERANCE) {
+    } else if (Math.abs(frequency - lastTone) > FREQUENCY_TOLERANCE) {
         const duration = now - toneStartTime;
-        //console.log(`continuing tone ${frequency} for ${duration} ms`);
-    } else {
-        const duration = now - toneStartTime;
-        //console.log(`tone changed: ${lastTone} lasted ${duration} ms`);
         toneHistory.push({ freq: lastTone, duration });
         detectQC2Pair();
 
         lastTone = frequency;
         toneStartTime = now;
-        //console.log(`new tone started: ${frequency}`);
     }
 }
 
 function detectQC2Pair() {
-    if (toneHistory.length < 2) {
-        //console.log('not enough tones in history to detect qc2');
-        return;
-    }
+    if (toneHistory.length < 2) return;
 
     const recent = toneHistory.slice(-2);
     const [toneA, toneB] = recent;
@@ -1607,30 +1626,23 @@ function detectQC2Pair() {
     const durationA = toneA.duration;
     const durationB = toneB.duration;
 
-    //console.log(`checking pair: A=${toneA.freq} Hz (${durationA} ms), B=${toneB.freq} (${durationB} ms)`);
+    console.log(`checking pair: A=${toneA.freq} Hz (${durationA} ms), B=${toneB.freq} (${durationB} ms)`);
 
-    if (
-        durationA >= 900 && durationA <= 1200 &&
-        durationB >= 2500 && durationB <= 3500
-    ) {
-        console.log(`QC2 Pair Detected A: ${toneA.freq}, B: ${toneB.freq}`);
-
+    if (durationA >= 5 && durationA <= 1200 && durationB >= 20 && durationB <= 3500) {
         if (currentCodeplug.qcList != null) {
             for (const pair of currentCodeplug.qcList) {
                 const isMatchA = Math.abs(toneA.freq - pair.a) <= FREQ_MATCH_THRESHOLD;
                 const isMatchB = Math.abs(toneB.freq - pair.b) <= FREQ_MATCH_THRESHOLD;
 
                 if (isMatchA && isMatchB) {
-                    console.log(`QC2 ALERT: A=${pair.a} B=${pair.b}`);
-                    minitorStandard();
+                    console.log(`QC2 Match: A=${pair.a}, B=${pair.b}`);
+                    minitorStandard();  // Start paging workflow
+                    tonesQueue.push({ a: pair.a, b: pair.b });
                     break;
                 }
             }
         }
-
         toneHistory = [];
-    } else {
-        //console.log(`no QC2 pattern`);
     }
 }
 
@@ -1810,12 +1822,50 @@ function buttonBeep() {
 }
 
 function minitorStandard() {
-    playSoundEffect('audio/minitor_standard.wav');
+    if (isPaging) return; // Already paging
+    isPaging = true;
+
+    isAlertPlaying = true;
+    playSoundEffect('audio/minitor_standard.wav', () => {
+        isAlertPlaying = false;
+        tryPlayNextTone();
+    });
 }
 
-function playSoundEffect(audioPath) {
-    let audio = new Audio(audioPath);
-    audio.play().then();
+function tryPlayNextTone() {
+    if (isTonePlaying || isAlertPlaying) return;
+
+    const nextTone = tonesQueue.shift();
+    if (!nextTone) {
+        isPaging = false;
+        return;
+    }
+
+    playToneSet(nextTone.a, nextTone.b, () => {
+        tryPlayNextTone();
+    });
+}
+
+function playToneSet(freqA, freqB, onComplete) {
+    isTonePlaying = true;
+    console.log(`Playing Tone A=${freqA}, B=${freqB}`);
+    
+    setTimeout(() => {
+        isTonePlaying = false;
+        onComplete?.();
+    }, 4000);
+}
+
+function playSoundEffect(audioPath, onComplete) {
+    const audio = new Audio(audioPath);
+    audio.play().then(() => {
+        audio.onended = () => {
+            onComplete?.();
+        };
+    }).catch((err) => {
+        console.error('Error playing sound:', err);
+        onComplete?.(); 
+    });
 }
 
 
