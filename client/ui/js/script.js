@@ -14,7 +14,7 @@
 * You should have received a copy of the GNU General Public License
 * along with this program.  If not, see <http://www.gnu.org/licenses/>.
 *
-* Copyright (C) 2024-2025 Caleb, K4PHP
+* Copyright (C) 2024-2026 Caleb, K4PHP
 *
 */
 
@@ -22,7 +22,12 @@ const pcmPlayer = new PCMPlayer({encoding: '16bitInt', channels: 1, sampleRate: 
 const micCapture = new MicCapture(onAudioFrameReady);
 
 const EXPECTED_PCM_LENGTH = 1600;
+const CONV_PCM_LENGTH = 320;
 const MAX_BUFFER_SIZE = EXPECTED_PCM_LENGTH * 2;
+const MDC_LEAD_SILENCE_SAMPLES = 0;
+const MDC_TAIL_SILENCE_SAMPLES = 0;
+const MDC_PREAMBLE_BYTES = 0;
+const MDC_VOICE_DELAY_MS = 260;
 
 const FREQUENCY_TOLERANCE = 10;
 const FREQ_MATCH_THRESHOLD = 5;
@@ -68,6 +73,7 @@ let isVoiceGrantHandled = false;
 let isReceiving = false;
 let scanTgActive = false;
 let isReceivingParkedChannel = false;
+let isOnConvChannel = false;
 
 let affiliationCheckInterval;
 let registrationCheckInterval;
@@ -91,6 +97,12 @@ let haltAllLine3Messages = false;
 let scanEnabled = false;
 let error = null;
 let volumeLevel = 1.0;
+let currentConvFreq = "";
+let currentConvRxSrcId = null;
+let mdcDecoder = null;
+let mdcPttSent = false;
+let mdcVoiceHoldUntil = 0;
+let socketMode = null;
 
 let currentLat = null;
 let currentLng = null;
@@ -104,6 +116,117 @@ let tonesQueue = [];
 
 function socketOpen() {
     return socket && socket.readyState === WebSocket.OPEN;
+}
+
+function resetMdcDecoder() {
+    mdcDecoder = null;
+}
+
+function resetConvReceive() {
+    currentConvRxSrcId = null;
+    resetMdcDecoder();
+}
+
+function getCurrentZone() {
+    if (!currentCodeplug || !currentCodeplug.zones) return null;
+    return currentCodeplug.zones[currentZoneIndex];
+}
+
+function getCurrentChannel() {
+    const currentZone = getCurrentZone();
+    if (!currentZone || !currentZone.channels) return null;
+    return currentZone.channels[currentChannelIndex];
+}
+
+function getSystemForChannel(channel) {
+    if (!channel || !currentCodeplug || !currentCodeplug.systems) return null;
+    return currentCodeplug.systems.find(system => system.name === channel.system) || null;
+}
+
+function getCurrentSystem() {
+    return getSystemForChannel(getCurrentChannel());
+}
+
+function getSystemMode(system) {
+    if (!system || !system.mode) return "trunking";
+    return system.mode.toString().toLowerCase();
+}
+
+function isConventionalMode(mode) {
+    return mode === "conv" || mode === "conventional" || mode === "mdcconv";
+}
+
+function isCurrentConventional() {
+    return isConventionalMode(getSystemMode(getCurrentSystem()));
+}
+
+function normalizeFrequency(frequency) {
+    if (frequency == null) return null;
+
+    const parsed = Number(frequency);
+    if (!Number.isNaN(parsed))
+        return parsed.toFixed(5).replace(/0+$/, "").replace(/\.$/, "");
+
+    return frequency.toString();
+}
+
+function frequenciesMatch(a, b) {
+    const freqA = normalizeFrequency(a);
+    const freqB = normalizeFrequency(b);
+
+    return freqA !== null && freqB !== null && freqA === freqB;
+}
+
+function getCurrentChannelFrequency() {
+    const currentChannel = getCurrentChannel();
+    if (!currentChannel || currentChannel.frequency == null) return null;
+    return normalizeFrequency(currentChannel.frequency);
+}
+
+function getCurrentMdcMode() {
+    return getSystemMode(getCurrentSystem()) === "mdcconv" ? 0x01 : 0x00;
+}
+
+function isMdcVoiceMode(mode) {
+    return mode === 0x01 || mode === "1" || mode === "ANALOG_MDC" || mode === "mdc" || mode === "mdcconv";
+}
+
+function getSystemAuthKey(system) {
+    if (!system) return "";
+    if (system.authKey != null) return system.authKey;
+    if (!currentCodeplug || !currentCodeplug.systems) return "";
+
+    const match = currentCodeplug.systems.find(other =>
+        other !== system &&
+        other.address === system.address &&
+        other.port === system.port &&
+        other.authKey != null
+    );
+
+    return match ? match.authKey : "";
+}
+
+function setTxIndicator() {
+    document.getElementById("rssi-icon").src = `models/${radioModel}/icons/tx.png`;
+
+    if (isMobile() && radioModel !== "E5" && radioModel !== "APX4500-G") {
+        redIcon.src = `models/${radioModel}/icons/red.png`;
+        redIcon.style.display = 'block';
+    }
+
+    if (radioModel === "APXNext") {
+        txBox.style.display = "block";
+        rxBox.style.display = "none";
+        txBox.style.backgroundColor = "red";
+    }
+}
+
+function clearTxIndicator() {
+    document.getElementById("rssi-icon").src = `models/${radioModel}/icons/rssi${currentRssiLevel}.png`;
+    if (isMobile()) redIcon.style.display = 'none';
+    if (radioModel === "APXNext") {
+        txBox.style.display = "none";
+    }
 }
 
 let beepVolumeReduction = 0.6; // default value
@@ -257,10 +380,17 @@ function startCheckLoop() {
             redIcon.style.display = 'none';
             txBox.style.display = "none";
             pcmPlayer.clear();
+            resetConvReceive();
         }
     }, 1000);
 
     setTimeout(() => {
+        if (isCurrentConventional()) {
+            isRegistered = true;
+            isAffiliated = true;
+            return;
+        }
+
         sendRegistration().then(() => {
             setTimeout(() => {
                 if (isRegistered) {
@@ -274,7 +404,7 @@ function startCheckLoop() {
     }, 2000);
 
     locationBroadcastInterval = setInterval(() => {
-        if (!socketOpen() || !isInRange || !radioOn || !isRegistered) {
+        if (!socketOpen() || !isInRange || !radioOn || !isRegistered || isCurrentConventional()) {
             return;
         }
 
@@ -292,7 +422,7 @@ function startCheckLoop() {
     }, 8000);
 
     affiliationCheckInterval = setInterval(() => {
-        if (!socketOpen() || !isInRange || !radioOn) {
+        if (!socketOpen() || !isInRange || !radioOn || isCurrentConventional()) {
             return;
         }
 
@@ -305,7 +435,7 @@ function startCheckLoop() {
     let clearedDisplay = false;
 
     registrationCheckInterval = setInterval(() => {
-        if (!socketOpen() || !isInRange || !radioOn) {
+        if (!socketOpen() || !isInRange || !radioOn || isCurrentConventional()) {
             return;
         }
 
@@ -340,6 +470,8 @@ function stopCheckLoop() {
 async function sendAffiliation() {
     if (isScannerModel())
         return;
+    if (isCurrentConventional())
+        return;
 
     try {
         if (radioModel === "APXNext") {
@@ -372,6 +504,10 @@ async function sendAffiliation() {
 async function sendRegistration() {
     if (isScannerModel())
         return;
+    if (isCurrentConventional()) {
+        isRegistered = true;
+        return;
+    }
 
     try {
         if (radioModel === "APXNext") {
@@ -458,7 +594,7 @@ window.addEventListener('message', async function (event) {
             return;
         }
 
-        if (!isRegistered) {
+        if (!isCurrentConventional() && !isRegistered) {
             console.log("Not registered, not txing");
             bonk();
             SendRegistrationRequest();
@@ -480,19 +616,26 @@ window.addEventListener('message', async function (event) {
 
         isVoiceGrantHandled = true;
 
-        if (!isInSiteTrunking) {
-            document.getElementById("rssi-icon").src = `models/${radioModel}/icons/tx.png`;
-
-            if (isMobile() && radioModel !== "E5" && radioModel !== "APX4500-G") { // E5 temp fix
-                redIcon.src = `models/${radioModel}/icons/red.png`;
-                redIcon.style.display = 'block';
+        if (isCurrentConventional()) {
+            const frequency = getCurrentChannelFrequency();
+            if (frequency === null) {
+                console.warn("Conventional channel missing frequency");
+                bonk();
+                isVoiceGrantHandled = false;
+                return;
             }
 
-            if (radioModel === "APXNext") {
-                txBox.style.display = "block";
-                rxBox.style.display = "none";
-                txBox.style.backgroundColor = "red";
-            }
+            currentFrequncyChannel = frequency;
+            currentConvFreq = frequency;
+            mdcPttSent = false;
+            mdcVoiceHoldUntil = 0;
+            audioBuffer = [];
+            isVoiceRequested = false;
+            isVoiceGranted = true;
+            isTxing = true;
+            setTxIndicator();
+        } else if (!isInSiteTrunking) {
+            setTxIndicator();
 
             await sleep(50);
 
@@ -530,20 +673,27 @@ window.addEventListener('message', async function (event) {
         if (isScannerModel())
             return;
 
-        await sleep(655); // Temp fix to ensure all voice data makes it through before releasing; Is this correct?
-                              // Should we check if the audio buffer is empty instead? Now I am just talking to myself..
-
         isVoiceGrantHandled = false;
 
-        if (isTxing && isRegistered) {
+        if (isTxing && isCurrentConventional()) {
+            await sleep(25);
+            isTxing = false;
+            isVoiceGranted = false;
+            SendConvVoiceTerm(myRid, currentTg, getCurrentMdcMode(), currentFrequncyChannel);
+            mdcPttSent = false;
+            mdcVoiceHoldUntil = 0;
+        } else if (isTxing && isRegistered) {
+            await sleep(655); // Temp fix to ensure all voice data makes it through before releasing; Is this correct?
+                                  // Should we check if the audio buffer is empty instead? Now I am just talking to myself..
             SendGroupVoiceRelease();
             currentFrequncyChannel = null;
         } else {
             console.debug("not txing not releasing");
         }
 
-        document.getElementById("rssi-icon").src = `models/${radioModel}/icons/rssi${currentRssiLevel}.png`;
+        clearTxIndicator();
         isTxing = false;
+        isVoiceGranted = false;
     } else if (event.data.type === 'showStartupMessage') {
         document.getElementById('startup-message').style.display = 'block';
     } else if (event.data.type === 'hideStartupMessage') {
@@ -762,7 +912,7 @@ async function powerOn(reReg) {
 
         connectWebSocket();
 
-        if (reReg) {
+        if (reReg && !isCurrentConventional()) {
             SendRegistrationRequest();
             SendGroupAffiliationRequest();
         }
@@ -783,7 +933,7 @@ async function powerOff(stayConnected) {
             body: JSON.stringify({ poweredOn: false })
         });
         stopCheckLoop();
-        if (!stayConnected)
+        if (!stayConnected && !isCurrentConventional())
             await SendDeRegistrationRequest();
         await sleep(1000);
 
@@ -937,6 +1087,9 @@ function SetSiteStatus(sid, status, sites) {
 }
 
 function StartEmergencyAlarm() {
+    if (isCurrentConventional())
+        return;
+
     if (!isRegistered || !isInRange || isInSiteTrunking)
         return;
 
@@ -959,9 +1112,13 @@ function StartEmergencyAlarm() {
 }
 
 function changeChannel(direction) {
+    const previousTg = currentTg;
+    const previousConv = isOnConvChannel;
+
     isTxing = false;
     isReceiving = false;
     isReceivingParkedChannel = false;
+    resetConvReceive();
 
     scanOff();
 
@@ -988,12 +1145,17 @@ function changeChannel(direction) {
 
     // responsiveVoice.speak(`${currentChannel.name}`, `US English Female`, {rate: .8});
 
-    SendGroupAffiliationRemoval(currentTg);
+    if (!previousConv && previousTg !== null) {
+        SendGroupAffiliationRemoval(previousTg);
+    }
 
     updateDisplay();
 
-    if (!isInSiteTrunking) {
+    if (!isCurrentConventional() && !isInSiteTrunking) {
         sendAffiliation().then();
+    } else if (isCurrentConventional()) {
+        isRegistered = true;
+        isAffiliated = true;
     } else {
         isAffiliated = false;
     }
@@ -1001,9 +1163,13 @@ function changeChannel(direction) {
 }
 
 function changeZone(direction) {
+    const previousTg = currentTg;
+    const previousConv = isOnConvChannel;
+
     isTxing = false;
     isReceiving = false;
     isReceivingParkedChannel = false;
+    resetConvReceive();
 
     scanOff();
 
@@ -1025,12 +1191,17 @@ function changeZone(direction) {
 
     // responsiveVoice.speak(`${currentZone.name}`, `US English Female`, {rate: .8});
     // responsiveVoice.speak(`${currentChannel.name}`, `US English Female`, {rate: .8});
-    SendGroupAffiliationRemoval(currentTg);
+    if (!previousConv && previousTg !== null) {
+        SendGroupAffiliationRemoval(previousTg);
+    }
 
     updateDisplay();
 
-    if (!isInSiteTrunking) {
+    if (!isCurrentConventional() && !isInSiteTrunking) {
         sendAffiliation().then();
+    } else if (isCurrentConventional()) {
+        isRegistered = true;
+        isAffiliated = true;
     } else {
         isAffiliated = false;
     }
@@ -1041,10 +1212,25 @@ function changeZone(direction) {
 function updateDisplay() {
     const currentZone = currentCodeplug.zones[currentZoneIndex];
     const currentChannel = currentZone.channels[currentChannelIndex];
+    const currentSystem = getSystemForChannel(currentChannel);
 
     setLine1(currentZone.name);
     setLine2(currentChannel.name);
-    currentTg = currentChannel.tgid.toString();
+    isOnConvChannel = isConventionalMode(getSystemMode(currentSystem));
+
+    if (isOnConvChannel) {
+        currentTg = currentChannel.tgid != null ? currentChannel.tgid.toString() : null;
+        currentFrequncyChannel = currentChannel.frequency != null ? currentChannel.frequency.toString() : null;
+        currentConvFreq = currentFrequncyChannel || "";
+        isRegistered = true;
+        isAffiliated = true;
+        resetConvReceive();
+    } else {
+        currentTg = currentChannel.tgid.toString();
+        currentFrequncyChannel = null;
+        currentConvFreq = "";
+        resetConvReceive();
+    }
 }
 
 async function hashKey(key) {
@@ -1063,24 +1249,26 @@ async function hashKey(key) {
 }
 
 async function reconnectIfSystemChanged() {
-    const currentZone = currentCodeplug.zones[currentZoneIndex];
-    const currentChannel = currentZone.channels[currentChannelIndex];
-    const currentSystem = currentCodeplug.systems.find(system => system.name === currentChannel.system);
+    const currentSystem = getCurrentSystem();
+    if (currentSystem === null) {
+        setLine2("Fail 01/82");
+        return;
+    }
 
     pcmPlayer.clear();
+    resetConvReceive();
 
-    const hashedAuthKey = await hashKey(currentSystem.authKey);
+    const hashedAuthKey = await hashKey(getSystemAuthKey(currentSystem));
     const masterEndpoint = `ws://${currentSystem.address}:${currentSystem.port}/client?authKey=${encodeURIComponent(hashedAuthKey)}`;
+    const desiredMode = isCurrentConventional() ? "conv" : "trunking";
 
-    if (socket && socket.url !== masterEndpoint) {
-        disconnectWebSocket();
+    if (socket && (socket.url !== masterEndpoint || socketMode !== desiredMode)) {
         connectWebSocket();
-        if (!isInSiteTrunking) {
-            sendRegistration().then(() => {
-            });
-        } else {
-            isRegistered = false;
-        }
+        return;
+    }
+
+    if (socketOpen() && isCurrentConventional()) {
+        socket.send("CONVENTIONAL_PEER_ENABLE");
     }
 }
 
@@ -1108,14 +1296,19 @@ async function connectWebSocket() {
         socket = null;
     }
 
-    const hashedAuthKey = await hashKey(currentSystem.authKey);
+    const hashedAuthKey = await hashKey(getSystemAuthKey(currentSystem));
     const masterEndpoint = `ws://${currentSystem.address}:${currentSystem.port}/client?authKey=${encodeURIComponent(hashedAuthKey)}`;
+    const connectedMode = isCurrentConventional() ? "conv" : "trunking";
 
+    console.debug(`Opening ${connectedMode} websocket to ${currentSystem.address}:${currentSystem.port}`);
     socket = new WebSocket(masterEndpoint);
     socket.binaryType = 'arraybuffer';
+    socketMode = connectedMode;
 
-    socket.onopen = () => {
-        if (isScannerModel()){
+    socket.onopen = event => {
+        if (event.currentTarget !== socket) return;
+
+        if (isScannerModel() || connectedMode === "conv"){
             socket.send("CONVENTIONAL_PEER_ENABLE");
             console.log("connected as conv peer, aff restrictions will be ignored");
         }
@@ -1128,12 +1321,17 @@ async function connectWebSocket() {
         isVoiceGrantHandled = false;
         isTxing = false;
         // console.debug("Codeplug: " + currentCodeplug);
-        if (!isScannerModel())
+        if (!isScannerModel() && connectedMode !== "conv")
             startCheckLoop();
         pcmPlayer.clear();
     };
 
-    socket.onclose = () => {
+    socket.onclose = event => {
+        if (event.currentTarget !== socket) return;
+
+        console.debug(`WebSocket connection closed: ${event.code} ${event.reason || ""} (${socketMode || "unknown"})`);
+        socket = null;
+        socketMode = null;
         isInSiteTrunking = true;
         document.getElementById("rssi-icon").src = `models/${radioModel}/icons/rssi${currentRssiLevel}.png`;
         redIcon.style.display = 'none';
@@ -1145,11 +1343,15 @@ async function connectWebSocket() {
         isReceivingParkedChannel = false;
         scanTgActive = false;
         isTxing = false;
-        console.debug('WebSocket connection closed');
         pcmPlayer.clear();
+        resetConvReceive();
     }
 
     socket.onerror = (error) => {
+        if (error.currentTarget !== socket) return;
+
+        socket = null;
+        socketMode = null;
         isInSiteTrunking = true;
         setUiSiteTrunking(isInRange);
         isVoiceGranted = false;
@@ -1161,16 +1363,29 @@ async function connectWebSocket() {
         console.error('WebSocket error:');
         console.error(error);
         pcmPlayer.clear();
+        resetConvReceive();
     }
 
     socket.onmessage = (event) => {
-        const data = JSON.parse(event.data);
+        if (event.currentTarget !== socket) return;
+
+        if (typeof event.data !== 'string') {
+            return;
+        }
+
+        let data;
+        try {
+            data = JSON.parse(event.data);
+        } catch {
+            console.debug("Received non-json message from master:", event.data);
+            return;
+        }
 
         const currentZone = currentCodeplug.zones[currentZoneIndex];
         const currentChannel = currentZone.channels[currentChannelIndex];
         const currentSystem = currentCodeplug.systems.find(system => system.name === currentChannel.system);
 
-        if (typeof event.data === 'string') {
+        if (data) {
             // console.debug(`Received WlinkPacket from master: ${event.data}`);
 
             // allow sts bcast so we know to turn a site back on (Fail rp ikr! chris would NOT approve)
@@ -1182,21 +1397,105 @@ async function connectWebSocket() {
                 return;
             }
 
-            if (data.type === packetToNumber("GRP_AFF_RSP")) {
+            // Conventional
+            if (data.type === packetToNumber("CONV_VOICE")) {
+                if (!isCurrentConventional()) {
+                    return;
+                }
+
+                if (data.data.SrcId != null && data.data.SrcId.toString() === myRid.toString())
+                    return;
+
+                const isMdc = isMdcVoiceMode(data.data.Mode);
+
+                if (!isMdc){
+                    console.warn("Only MDC analog is supported for conv right now! invalid CONV_VOICE mode..")
+                }
+
+                if (!frequenciesMatch(currentConvFreq, data.data.Frequency)){
+                    return;
+                }
+
+                const packetFrequency = normalizeFrequency(data.data.Frequency);
+                if (currentConvFreq !== packetFrequency) {
+                    currentConvFreq = packetFrequency;
+                    resetConvReceive();
+                }
+
+                if (data.data.SrcId != null && !isReceiving) {
+                    currentConvRxSrcId = data.data.SrcId.toString();
+                    showConvSrcId(currentConvRxSrcId);
+                    document.getElementById("rssi-icon").src = `models/${radioModel}/icons/rx.png`;
+                    if (radioModel === "APXNext") rxBox.style.display = "block";
+                    if (isMobile()) {
+                        yellowIcon.src = `models/${radioModel}/icons/yellow.png`;
+                        yellowIcon.style.display = 'block';
+                    }
+                }
+
+                // for now, just play it. we will worry about gating it later.... TODO TODO TODO
+                lastAudioTime = Date.now();
+                isReceiving = true;
+                const binaryString = atob(data.data.Data);
+                const len = binaryString.length;
+                const bytes = new Uint8Array(len);
+                for (let i = 0; i < len; i++) {
+                    bytes[i] = binaryString.charCodeAt(i);
+                }
+                handleAudioData(bytes.buffer, isMdc);
+            }
+            else if (data.type === packetToNumber("CONV_VOICE_TERM")) {
+                if (!isCurrentConventional())
+                    return;
+
+                if (!frequenciesMatch(currentConvFreq, data.data.Frequency))
+                    return;
+
+                isReceiving = false;
+                isReceivingParkedChannel = false;
+                scanTgActive = false;
+                resetConvReceive();
+                pcmPlayer.clear();
+
+                if (!isInRange) {
+                    setUiOOR(isInRange);
+                } else if (isInSiteTrunking) {
+                    setUiSiteTrunking(isInSiteTrunking);
+                } else {
+                    haltAllLine3Messages = false;
+                    document.getElementById("line3").innerHTML = '';
+                }
+
+                document.getElementById("rssi-icon").src = `models/${radioModel}/icons/rssi${currentRssiLevel}.png`;
+                yellowIcon.style.display = 'none';
+                rxBox.style.display = "none";
+            }
+
+            // Trunking
+            else if (data.type === packetToNumber("GRP_AFF_RSP")) {
+                if (isCurrentConventional() || currentTg == null)
+                    return;
+
                 //console.log(currentTg + " " + myRid);
-                if (data.data.SrcId.trim() !== myRid.trim() || data.data.DstId.trim() !== currentTg) {
+                if (data.data.SrcId?.toString().trim() !== myRid.toString().trim() || data.data.DstId?.toString().trim() !== currentTg.toString()) {
                     return;
                 }
 
                 console.log("Affiliation accepted");
                 isAffiliated = data.data.Status === 0;
             } else if (data.type === packetToNumber("U_REG_RSP")) {
+                if (isCurrentConventional())
+                    return;
+
                 if (data.data.SrcId !== myRid) {
                     return;
                 }
 
                 isRegistered = data.data.Status === 0;
             } else if (data.type === packetToNumber("AUDIO_DATA")) {
+                if (isCurrentConventional())
+                    return;
+
                 if (currentFrequncyChannel == null)
                     return;
 
@@ -1213,6 +1512,9 @@ async function connectWebSocket() {
                     console.log("ignoring audio, not for us");
                 }
             } else if (data.type === packetToNumber("GRP_VCH_RSP")) {
+                if (isCurrentConventional())
+                    return;
+
                 if (data.data.SrcId !== myRid && data.data.DstId === currentTg && data.data.Status === 0 && !scanTgActive) {
                     isReceiving = true;
                     isReceivingParkedChannel = true;
@@ -1312,6 +1614,9 @@ async function connectWebSocket() {
                     bonk();
                 }
             } else if (data.type === packetToNumber("GRP_VCH_RLS")) {
+                if (isCurrentConventional())
+                    return;
+
                 if (data.data.SrcId !== myRid && data.data.DstId === currentTg && !scanTgActive) {
                     haltAllLine3Messages = false;
                     if (!isInRange) {
@@ -1430,6 +1735,9 @@ async function connectWebSocket() {
                     pcmPlayer.clear();
                 }
             } else if (data.type === packetToNumber("GRP_VCH_UPD")) {
+                if (isCurrentConventional())
+                    return;
+
                 if (data.data.VoiceChannel.SrcId.toString() == null)
                     return;
 
@@ -1494,12 +1802,12 @@ function setUiSiteTrunking(inSt) {
         return;
     }
 
-    if (!haltAllLine3Messages) {
-        if (!inSt) {
-            haltAllLine3Messages = false;
-            line3.innerHTML = '';
-            line3.style.backgroundColor = '';
-        } else {
+    if (!inSt) {
+        haltAllLine3Messages = false;
+        line3.innerHTML = '';
+        line3.style.backgroundColor = '';
+    } else {
+        if (!haltAllLine3Messages) {
             haltAllLine3Messages = true;
             line3.innerHTML = 'Site trunking';
             line3.style.color = 'black';
@@ -1520,17 +1828,65 @@ function setLine3(text) {
     document.getElementById('line3').innerHTML = text;
 }
 
-function handleAudioData(data) {
+function handleMdcPacket(packet) {
+    if (!packet) return;
+
+    const srcId = packet.unitID.toString();
+    currentConvRxSrcId = currentConvRxSrcId || srcId;
+    showConvSrcId(srcId);
+}
+
+function showConvSrcId(srcId) {
+    if (srcId == null) return;
+
+    const line3 = document.getElementById("line3");
+    haltAllLine3Messages = true;
+
+    if (isScannerModel()) {
+        line3.style.color = "white";
+        line3.innerHTML = `Fm:[${srcId}]`;
+    } else {
+        line3.style.color = "black";
+        line3.innerHTML = `ID: ${srcId}`;
+    }
+}
+
+function processMdcData(dataArray) {
+    if (typeof Mdc1200 === 'undefined') {
+        return;
+    }
+
+    if (mdcDecoder === null) {
+        mdcDecoder = new Mdc1200.Decoder(8000);
+    }
+
+    const rv = mdcDecoder.processSamples(dataArray);
+
+    if (rv === 1) {
+        handleMdcPacket(mdcDecoder.getPacket());
+    } else if (rv === 2) {
+        handleMdcPacket(mdcDecoder.getDoublePacket());
+    }
+}
+
+function handleAudioData(data, isMdc = false) {
     let dataArray = new Uint8Array(data);
 
     if (dataArray.length > 0) {
+        if (isMdc) {
+            processMdcData(dataArray);
+        }
+
         // Apply input gain if enabled and configured
         if (audioGainConfig.enabled && audioGainConfig.inputGain !== 1.0) {
             const processedBuffer = applyInputGain(dataArray.buffer, audioGainConfig.inputGain);
             dataArray = new Uint8Array(processedBuffer);
         }
-        
+
         pcmPlayer.feed(dataArray);
+
+        if (isMdc)
+            return;
 
         const float32Array = new Float32Array(dataArray.length / 2);
         for (let i = 0; i < dataArray.length; i += 2) {
@@ -1771,13 +2127,80 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function appendAudioBuffer(buffer) {
+    for (let i = 0; i < buffer.length; i++)
+        audioBuffer.push(buffer[i]);
+}
+
+function encodePcmBytes(buffer) {
+    let binary = "";
+
+    for (let i = 0; i < buffer.length; i++)
+        binary += String.fromCharCode(buffer[i]);
+
+    return btoa(binary);
+}
+
+function encodeMdcPttId() {
+    const unitId = parseInt(myRid, 10) & 0xffff;
+    const samples = Mdc1200.encodePacket(0x01, 0x00, unitId, {sampleRate: 8000, preamble: MDC_PREAMBLE_BYTES});
+    const pcm = new Uint8Array((MDC_LEAD_SILENCE_SAMPLES + samples.length + MDC_TAIL_SILENCE_SAMPLES) * 2);
+    let offset = MDC_LEAD_SILENCE_SAMPLES * 2;
+
+    for (let i = 0; i < samples.length; i++) {
+        pcm[offset++] = samples[i] & 0xff;
+        pcm[offset++] = (samples[i] >> 8) & 0xff;
+    }
+
+    return pcm;
+}
+
+function sendConventionalPcm(buffer) {
+    for (let i = 0; i < buffer.length; i += CONV_PCM_LENGTH) {
+        let frame = buffer.slice(i, i + CONV_PCM_LENGTH);
+
+        if (frame.length < CONV_PCM_LENGTH) {
+            const padded = new Uint8Array(CONV_PCM_LENGTH);
+            padded.set(frame);
+            frame = padded;
+        }
+
+        SendConvVoice(encodePcmBytes(frame), myRid, currentTg, getCurrentMdcMode(), currentFrequncyChannel);
+    }
+}
+
+function holdConventionalVoiceForMdc() {
+    if (getCurrentMdcMode() === 0x01 && !mdcPttSent && typeof Mdc1200 !== 'undefined') {
+        sendConventionalPcm(encodeMdcPttId());
+        mdcPttSent = true;
+        mdcVoiceHoldUntil = Date.now() + MDC_VOICE_DELAY_MS;
+        return true;
+    }
+
+    return Date.now() < mdcVoiceHoldUntil;
+}
+
 function onAudioFrameReady(buffer, rms) {
     if (isTxing && currentFrequncyChannel !== null) {
         if (fringVC) {
             const degradedBuffer = simulateFringeCoverage(buffer, 8000);
-            audioBuffer.push(...degradedBuffer);
+            if (isCurrentConventional()) {
+                if (holdConventionalVoiceForMdc()) return;
+
+                sendConventionalPcm(degradedBuffer);
+                return;
+            }
+
+            appendAudioBuffer(degradedBuffer);
         } else {
-            audioBuffer.push(...buffer);
+            if (isCurrentConventional()) {
+                if (holdConventionalVoiceForMdc()) return;
+
+                sendConventionalPcm(buffer);
+                return;
+            }
+
+            appendAudioBuffer(buffer);
         }
 
         if (audioBuffer.length > MAX_BUFFER_SIZE) {
@@ -1789,31 +2212,42 @@ function onAudioFrameReady(buffer, rms) {
             const fullFrame = audioBuffer.slice(0, EXPECTED_PCM_LENGTH);
             audioBuffer = audioBuffer.slice(EXPECTED_PCM_LENGTH);
 
-            const response = {
-                type: 0x01,
-                rms: rms * 30.0,
-                data: {
-                    VoiceChannel: {
-                        SrcId: myRid,
-                        DstId: currentTg,
-                        Frequency: currentFrequncyChannel
-                    },
-                    Site: currentSite,
-                    Data: fullFrame
-                }
-            };
+            if (isCurrentConventional()) {
+                const encoded = encodePcmBytes(fullFrame);
+                SendConvVoice(encoded, myRid, currentTg, getCurrentMdcMode(), currentFrequncyChannel);
+            } else {
+                const response = {
+                    type: 0x01,
+                    rms: rms * 30.0,
+                    data: {
+                        VoiceChannel: {
+                            SrcId: myRid,
+                            DstId: currentTg,
+                            Frequency: currentFrequncyChannel
+                        },
+                        Site: currentSite,
+                        Data: fullFrame
+                    }
+                };
 
-            const jsonString = JSON.stringify(response);
-            setTimeout(() => socket.send(jsonString), 0);
+                const jsonString = JSON.stringify(response);
+                setTimeout(() => socket.send(jsonString), 0);
+            }
         }
     }
 }
 
 function disconnectWebSocket() {
     if (socket) {
-        pcmPlayer.clear();
-        socket.close();
+        const oldSocket = socket;
         socket = null;
+        socketMode = null;
+        pcmPlayer.clear();
+        oldSocket.onopen = null;
+        oldSocket.onclose = null;
+        oldSocket.onerror = null;
+        oldSocket.onmessage = null;
+        oldSocket.close();
     }
 }
 
@@ -1874,6 +2308,11 @@ function knobClick() {
 }
 
 function scanOn() {
+    if (isCurrentConventional()) {
+        displayError("Fail 01/84");
+        return;
+    }
+
     const currentZone = currentCodeplug.zones[currentZoneIndex];
     const currentChannel = currentZone.channels[currentChannelIndex];
 
@@ -1887,8 +2326,10 @@ function scanOn() {
     }
 
     scanManager.getChannelsInScanList(currentScanList.name).forEach(channel => {
-        console.log("tgid " + channel.tgid)
-        SendGroupAffiliationRequest(channel.tgid);
+        if (channel.tgid != null) {
+            console.log("tgid " + channel.tgid)
+            SendGroupAffiliationRequest(channel.tgid);
+        }
     });
 
     scanEnabled = true;
