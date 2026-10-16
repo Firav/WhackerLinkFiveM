@@ -42,17 +42,29 @@ function applyInputGain(audioBuffer, gainMultiplier) {
     }
     
     const audio = new Int16Array(audioBuffer);
+
+    // Continuous soft clip: samples up to 80% of full scale pass through
+    // untouched (same as before), anything above the knee rolls off smoothly
+    // with a tanh curve and never exceeds full scale. Loud boosted audio
+    // (QC2 tones, hot voice) stays sine shaped instead of flattening into a
+    // square wave style hard clip, and quiet audio keeps the exact level it
+    // had before.
+    const SOFT_KNEE = 0.8;
+
     for (let i = 0; i < audio.length; i++) {
-        let sample = audio[i] * gainMultiplier;
+        const sample = audio[i] * gainMultiplier;
         
-        // Prevent hard clipping by soft limiting
-        if (sample > 32767) {
-            sample = 32767;
-        } else if (sample < -32768) {
-            sample = -32768;
+        if (sample > SOFT_KNEE * 32767 || sample < -SOFT_KNEE * 32767) {
+            const sign = sample < 0 ? -1 : 1;
+            const normalized = Math.abs(sample) / 32767;
+            
+            // tanh rolloff that is continuous at the knee and ceilings at 1.0
+            const softLimit = SOFT_KNEE + (1 - SOFT_KNEE) * Math.tanh((normalized - SOFT_KNEE) / (1 - SOFT_KNEE));
+            
+            audio[i] = Math.round(sign * Math.min(softLimit, 1.0) * 32767);
+        } else {
+            audio[i] = Math.round(sample);
         }
-        
-        audio[i] = Math.round(sample);
     }
     return audio.buffer;
 }

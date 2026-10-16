@@ -46,6 +46,7 @@ PCMPlayer.prototype.init = function(option) {
     this.typedArray = this.getTypedArray();
     this.currentVolume = 0.6;
     this.outputGain = 1.0;
+    this.limiterEnabled = false;
     this.createContext();
 };
 
@@ -80,7 +81,16 @@ PCMPlayer.prototype.createContext = function() {
 
     this.gainNode = this.audioCtx.createGain();
     this.gainNode.gain.value = 1;
-    this.gainNode.connect(this.audioCtx.destination);
+
+    // Peak limiter chained between the gain node and the destination. It stays
+    // in the graph permanently but in a fully transparent state (ratio 1,
+    // threshold 0) so the default pipeline is unchanged; when the output gain
+    // is boosted it engages and keeps loud signals (QC2 tones, hot voice)
+    // from slamming into the destination clipper at full scale.
+    this.limiterNode = this.audioCtx.createDynamicsCompressor();
+    this.setLimiterEnabled(false);
+    this.gainNode.connect(this.limiterNode);
+    this.limiterNode.connect(this.audioCtx.destination);
     this.startTime = this.audioCtx.currentTime;
     //console.debug("Audio context created!!");
 };
@@ -124,12 +134,50 @@ PCMPlayer.prototype.volume = function(volume) {
     console.log("Volume set to:", volume, "with output gain:", this.outputGain, "effective:", effectiveVolume);
 };
 
+PCMPlayer.prototype.setLimiterEnabled = function(enabled) {
+    this.limiterEnabled = !!enabled;
+
+    if (!this.limiterNode) {
+        return;
+    }
+
+    if (this.limiterEnabled) {
+        // Brickwall style limiter: whatever the output gain pushes above
+        // -6 dBFS is pulled back down, audio below the threshold keeps the
+        // full boost so quiet systems still benefit from the extra gain
+        this.limiterNode.threshold.value = -6;
+        this.limiterNode.knee.value = 3;
+        this.limiterNode.ratio.value = 20;
+        this.limiterNode.attack.value = 0.002;
+        this.limiterNode.release.value = 0.15;
+    } else {
+        // Transparent passthrough, identical to a plain gain node
+        this.limiterNode.threshold.value = 0;
+        this.limiterNode.knee.value = 0;
+        this.limiterNode.ratio.value = 1;
+        this.limiterNode.attack.value = 0.003;
+        this.limiterNode.release.value = 0.25;
+    }
+};
+
 PCMPlayer.prototype.setOutputGain = function(outputGain) {
     if (typeof outputGain !== 'number' || outputGain < 0) {
         console.warn("Output gain should be a positive number. Using 1.0");
         outputGain = 1.0;
     }
     this.outputGain = outputGain;
+
+    // Any boosted output gain engages the receive limiter so loud boosted
+    // signals (full scale QC2 tones from the console) stay well below full
+    // scale instead of running the output into clipping. At 1.0 or below the
+    // limiter is fully transparent and the old pipeline is preserved.
+    const limiterShouldBeEngaged = outputGain > 1.0;
+
+    if (this.limiterEnabled !== limiterShouldBeEngaged) {
+        this.setLimiterEnabled(limiterShouldBeEngaged);
+        console.log("Receive peak limiter " + (this.limiterEnabled ? "engaged" : "bypassed") + " (output gain:", outputGain, ")");
+    }
+
     // Re-apply current volume to incorporate the new gain
     this.volume(this.currentVolume || 1.0);
 };

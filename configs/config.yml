@@ -9,6 +9,8 @@ audioGain:
   inputGain: 1.0
   # Output gain multiplier applied through Web Audio API (1.0 = no change)  
   # This is cleaner than input gain and less likely to distort. Recommended range: 1.0 - 2.0
+  # Any value above 1.0 automatically engages a receive peak limiter so boosted loud
+  # signals (QC2 tones, hot traffic) are capped near -6 dBFS instead of clipping
   outputGain: 1.0
   # Enable/disable audio gain processing
   enabled: true
